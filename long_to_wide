@@ -1,0 +1,381 @@
+"""
+长表转宽表工具
+用于将半导体测试数据从长表格式转换为宽表格式
+"""
+
+import pandas as pd
+import numpy as np
+from typing import List, Optional
+
+
+def long_to_wide(
+    df: pd.DataFrame,
+    id_cols: List[str],
+    param_col: str,
+    value_col: str,
+    agg_func: str = 'first',
+    fill_value: Optional[float] = None
+) -> pd.DataFrame:
+    """
+    将长表转换为宽表
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        输入的长表数据
+    id_cols : List[str]
+        标识列（如 wafer_id, lot_id 等基本信息列）
+    param_col : str
+        参数名列（将被转换为宽表的列）
+    value_col : str
+        值列（将成为宽表的值）
+    agg_func : str
+        聚合函数，当同一组有多个值时使用，默认 'first'
+        可选: 'first', 'last', 'mean', 'max', 'min', 'sum'
+    fill_value : float, optional
+        缺失值填充值，默认为 None（不填充）
+
+    Returns:
+    --------
+    pd.DataFrame
+        转换后的宽表
+    """
+    # 1. 复制数据避免修改原数据
+    data = df.copy()
+
+    # 2. 按标识列和参数列聚合（处理重复值）
+    agg_dict = {value_col: agg_func}
+    # 如果有其他列，保留它们
+    other_cols = [col for col in data.columns if col not in id_cols + [param_col, value_col]]
+    for col in other_cols:
+        agg_dict[col] = agg_func
+
+    grouped = data.groupby(id_cols + [param_col], as_index=False).agg(agg_dict)
+
+    # 3. 长表转宽表 (pivot操作)
+    wide_df = grouped.pivot(
+        index=id_cols,
+        columns=param_col,
+        values=value_col
+    ).reset_index()
+
+    # 4. 处理多级列名（pivot后列名会变成多级）
+    wide_df.columns.name = None
+
+    # 5. 填充缺失值（可选）
+    if fill_value is not None:
+        # 只对数值列填充
+        value_cols = [col for col in wide_df.columns if col not in id_cols]
+        wide_df[value_cols] = wide_df[value_cols].fillna(fill_value)
+
+    return wide_df
+
+
+def merge_wafer_wide_tables(
+    wide_tables: List[pd.DataFrame],
+    id_cols: List[str],
+    how: str = 'outer',
+    sort: bool = True
+) -> pd.DataFrame:
+    """
+    合并多个wafer的宽表数据
+    处理不同wafer可能有不同参数列的情况
+
+    Parameters:
+    -----------
+    wide_tables : List[pd.DataFrame]
+        多个wafer的宽表列表
+    id_cols : List[str]
+        标识列
+    how : str
+        合并方式，默认 'outer'（保留所有列）
+        可选: 'inner', 'outer', 'left', 'right'
+    sort : bool
+        是否对结果排序，默认 True
+
+    Returns:
+    --------
+    pd.DataFrame
+        合并后的宽表
+    """
+    if not wide_tables:
+        return pd.DataFrame()
+
+    if len(wide_tables) == 1:
+        return wide_tables[0]
+
+    # 使用 reduce 进行多表合并
+    from functools import reduce
+
+    def merge_two(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+        """合并两个宽表"""
+        # 找出共同的标识列（可能有些表没有某些标识列）
+        common_id_cols = [col for col in id_cols if col in left.columns and col in right.columns]
+
+        if not common_id_cols:
+            # 如果没有共同标识列，简单拼接
+            return pd.concat([left, right], ignore_index=True)
+
+        # 合并
+        merged = pd.merge(
+            left, right,
+            on=common_id_cols,
+            how=how,
+            suffixes=('', '_dup')
+        )
+
+        # 处理重复的列（相同参数在不同表中都有值）
+        dup_cols = [col for col in merged.columns if col.endswith('_dup')]
+        for dup_col in dup_cols:
+            orig_col = dup_col.replace('_dup', '')
+            # 优先使用原始列的值，如果为空则使用重复列的值
+            if orig_col in merged.columns:
+                merged[orig_col] = merged[orig_col].combine_first(merged[dup_col])
+            else:
+                merged[orig_col] = merged[dup_col]
+            merged.drop(columns=[dup_col], inplace=True)
+
+        return merged
+
+    # 逐个合并所有表
+    result = reduce(merge_two, wide_tables)
+
+    # 排序
+    if sort and id_cols:
+        sort_cols = [col for col in id_cols if col in result.columns]
+        if sort_cols:
+            result = result.sort_values(by=sort_cols).reset_index(drop=True)
+
+    return result
+
+
+def process_long_to_wide_pipeline(
+    df: pd.DataFrame,
+    id_cols: List[str],
+    param_col: str,
+    value_col: str,
+    wafer_col: str = 'wafer_id',
+    agg_func: str = 'first',
+    fill_value: Optional[float] = None,
+    merge_how: str = 'outer'
+) -> pd.DataFrame:
+    """
+    完整的长表转宽表流程
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        输入的长表数据
+    id_cols : List[str]
+        标识列列表
+    param_col : str
+        参数名列
+    value_col : str
+        值列
+    wafer_col : str
+        wafer标识列名，用于分组处理
+    agg_func : str
+        聚合函数
+    fill_value : float, optional
+        缺失值填充值
+    merge_how : str
+        多wafer合并方式
+
+    Returns:
+    --------
+    pd.DataFrame
+        最终的宽表
+    """
+
+    # 1. 按 wafer 分组处理
+    if wafer_col not in df.columns:
+        # 如果没有wafer列，直接整体转换
+        return long_to_wide(df, id_cols, param_col, value_col, agg_func, fill_value)
+
+    wafer_groups = df.groupby(wafer_col, sort=False)
+    wide_tables = []
+
+    for wafer_id, wafer_data in wafer_groups:
+        print(f"处理 wafer: {wafer_id}, 记录数: {len(wafer_data)}")
+
+        # 转换当前wafer为宽表
+        wafer_wide = long_to_wide(
+            wafer_data,
+            id_cols,
+            param_col,
+            value_col,
+            agg_func,
+            fill_value
+        )
+
+        wide_tables.append(wafer_wide)
+
+    # 2. 合并所有wafer的宽表
+    print(f"\n合并 {len(wide_tables)} 个wafer的宽表数据...")
+    result = merge_wafer_wide_tables(wide_tables, id_cols, how=merge_how)
+
+    print(f"最终结果: {len(result)} 行, {len(result.columns)} 列")
+
+    return result
+
+
+# ==================== 使用示例 ====================
+
+def create_sample_data():
+    """创建示例数据，模拟半导体测试数据"""
+
+    # wafer1 的数据 - 有 Param1, Param2, Param3
+    data1 = [
+        # wafer_id, lot_id, die_x, die_y, param_name, param_value
+        ['W001', 'LOT_A', 0, 0, 'Param1', 1.23],
+        ['W001', 'LOT_A', 0, 0, 'Param2', 2.34],
+        ['W001', 'LOT_A', 0, 0, 'Param3', 3.45],
+        ['W001', 'LOT_A', 0, 1, 'Param1', 1.24],
+        ['W001', 'LOT_A', 0, 1, 'Param2', 2.35],
+        ['W001', 'LOT_A', 0, 1, 'Param3', 3.46],
+        ['W001', 'LOT_A', 1, 0, 'Param1', 1.25],
+        ['W001', 'LOT_A', 1, 0, 'Param2', 2.36],
+        ['W001', 'LOT_A', 1, 0, 'Param3', 3.47],
+    ]
+
+    # wafer2 的数据 - 有 Param1, Param2, Param4 (不同的参数集)
+    data2 = [
+        ['W002', 'LOT_A', 0, 0, 'Param1', 1.30],
+        ['W002', 'LOT_A', 0, 0, 'Param2', 2.40],
+        ['W002', 'LOT_A', 0, 0, 'Param4', 4.50],  # Param4 而不是 Param3
+        ['W002', 'LOT_A', 0, 1, 'Param1', 1.31],
+        ['W002', 'LOT_A', 0, 1, 'Param2', 2.41],
+        ['W002', 'LOT_A', 0, 1, 'Param4', 4.51],
+    ]
+
+    # wafer3 的数据 - 有 Param1, Param3, Param5 (又不同的参数集)
+    data3 = [
+        ['W003', 'LOT_B', 0, 0, 'Param1', 1.40],
+        ['W003', 'LOT_B', 0, 0, 'Param3', 3.50],
+        ['W003', 'LOT_B', 0, 0, 'Param5', 5.60],
+    ]
+
+    columns = ['wafer_id', 'lot_id', 'die_x', 'die_y', 'param_name', 'param_value']
+
+    df1 = pd.DataFrame(data1, columns=columns)
+    df2 = pd.DataFrame(data2, columns=columns)
+    df3 = pd.DataFrame(data3, columns=columns)
+
+    return pd.concat([df1, df2, df3], ignore_index=True)
+
+
+def main():
+    """主函数 - 演示完整流程"""
+
+    print("=" * 60)
+    print("长表转宽表示例")
+    print("=" * 60)
+
+    # 1. 创建示例数据
+    print("\n1. 创建示例数据...")
+    df_long = create_sample_data()
+    print(f"长表数据形状: {df_long.shape}")
+    print("\n原始长表数据预览:")
+    print(df_long.head(10))
+
+    # 2. 执行转换
+    print("\n" + "=" * 60)
+    print("2. 执行长表转宽表...")
+    print("=" * 60)
+
+    # 标识列
+    id_cols = ['wafer_id', 'lot_id', 'die_x', 'die_y']
+    param_col = 'param_name'
+    value_col = 'param_value'
+
+    df_wide = process_long_to_wide_pipeline(
+        df=df_long,
+        id_cols=id_cols,
+        param_col=param_col,
+        value_col=value_col,
+        wafer_col='wafer_id',
+        agg_func='first',
+        fill_value=np.nan,
+        merge_how='outer'
+    )
+
+    # 3. 查看结果
+    print("\n" + "=" * 60)
+    print("3. 转换结果")
+    print("=" * 60)
+    print(f"\n宽表数据形状: {df_wide.shape}")
+    print(f"列名: {list(df_wide.columns)}")
+    print("\n宽表数据预览:")
+    print(df_wide)
+
+    # 4. 保存结果
+    print("\n" + "=" * 60)
+    print("4. 保存结果到文件")
+    print("=" * 60)
+
+    df_wide.to_csv('wide_output.csv', index=False, encoding='utf-8-sig')
+    df_long.to_csv('long_input.csv', index=False, encoding='utf-8-sig')
+    print("结果已保存到: wide_output.csv")
+    print("原始数据已保存到: long_input.csv")
+
+    return df_wide
+
+
+# 进阶用法示例
+def advanced_examples():
+    """进阶用法示例"""
+
+    print("\n" + "=" * 60)
+    print("进阶用法示例")
+    print("=" * 60)
+
+    df = create_sample_data()
+
+    # 示例1: 自定义聚合函数
+    print("\n示例1: 使用 mean 聚合函数")
+    result1 = long_to_wide(
+        df[df['wafer_id'] == 'W001'],
+        id_cols=['wafer_id', 'lot_id', 'die_x', 'die_y'],
+        param_col='param_name',
+        value_col='param_value',
+        agg_func='mean'
+    )
+    print(result1)
+
+    # 示例2: 逐个处理wafer后手动合并
+    print("\n示例2: 逐个处理wafer并查看列差异")
+    wafer_groups = df.groupby('wafer_id')
+
+    for wafer_id, wafer_data in wafer_groups:
+        wide = long_to_wide(
+            wafer_data,
+            id_cols=['wafer_id', 'lot_id', 'die_x', 'die_y'],
+            param_col='param_name',
+            value_col='param_value'
+        )
+        print(f"\n{wafer_id} 的参数列: {[c for c in wide.columns if c not in ['wafer_id', 'lot_id', 'die_x', 'die_y']]}")
+
+    # 示例3: 处理有重复数据的情况
+    print("\n示例3: 处理重复数据")
+    # 创建有重复的数据
+    dup_data = [
+        ['W001', 'LOT_A', 0, 0, 'Param1', 1.0],
+        ['W001', 'LOT_A', 0, 0, 'Param1', 2.0],  # 重复
+    ]
+    df_dup = pd.DataFrame(dup_data, columns=['wafer_id', 'lot_id', 'die_x', 'die_y', 'param_name', 'param_value'])
+
+    # 使用 first
+    result_first = long_to_wide(df_dup, ['wafer_id', 'lot_id', 'die_x', 'die_y'], 'param_name', 'param_value', agg_func='first')
+    print(f"使用 first: {result_first['Param1'].values}")
+
+    # 使用 mean
+    result_mean = long_to_wide(df_dup, ['wafer_id', 'lot_id', 'die_x', 'die_y'], 'param_name', 'param_value', agg_func='mean')
+    print(f"使用 mean: {result_mean['Param1'].values}")
+
+
+if __name__ == '__main__':
+    # 运行主示例
+    main()
+
+    # 运行进阶示例
+    advanced_examples()
